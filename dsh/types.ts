@@ -36,12 +36,40 @@ export interface LlmService {
 
 export interface Session {
   readonly id: string;
+  readonly header?: { readonly origin?: string };
   deriveMessages(): readonly unknown[];
 }
 
-export interface Agent { readonly id: string; readonly session: Session }
+export interface UserMessage {
+  readonly role: "user";
+  readonly id: string;
+  readonly content: readonly TextBlock[];
+  readonly source: { readonly kind: string };
+}
+
+export interface Agent {
+  readonly id: string;
+  readonly session: Session;
+  /** Queue a message for the next step of the current turn. */
+  steer(message: UserMessage): void;
+}
 
 export interface ToolRunContext { readonly agent: Agent; readonly signal: AbortSignal }
+
+/** The execution identity seen by tool pipeline listeners. */
+export interface ToolExecution { readonly name: string; readonly agent?: Agent; readonly signal: AbortSignal }
+
+export interface ToolExecutionResult {
+  readonly isError: boolean;
+  readonly content: readonly { type: string; text?: string }[];
+}
+
+export type PostToolDecision = { kind: string; additionalContexts?: UserMessage[] } & Record<string, unknown>;
+
+export interface Events {
+  "agent/turn-stopping"(payload: { agent: Agent; turn: number; signal: AbortSignal }): Promise<void> | void;
+  "tools/post-execute"(exec: ToolExecution, result: ToolExecutionResult, next: () => Promise<PostToolDecision>): Promise<PostToolDecision>;
+}
 
 export interface ToolDefinition {
   name: string;
@@ -83,4 +111,5 @@ export interface Context {
   systemPrompt: { section(section: PromptSection): Dispose; getSectionOrder(name: string): number };
   llm: LlmService;
   effect(execute: () => Dispose | void, label?: string): unknown;
+  on<K extends keyof Events>(name: K, listener: Events[K]): Dispose;
 }

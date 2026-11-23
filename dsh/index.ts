@@ -1,23 +1,24 @@
 // DeepSeek Harness (dsh) plugin: the same advisor tool and /advisor command as the Pi extension.
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
-  ADVISOR_GUIDANCE, ADVISOR_SYSTEM, QUESTION_DESCRIPTION, TOOL_DESCRIPTION, UsageTally,
-  consultationPrompt, formatDuration, interpretAdvice, matchModels, parseConfig, readConfig, resolveModel, saveModel,
-  serializeTranscript, settingsOf, unavailable, type Advice, type AdvisorConfig,
+  ADVISOR_GUIDANCE, ADVISOR_SYSTEM, CONTEXT_DESCRIPTION, Consultant, QUESTION_DESCRIPTION, REVIEW_QUESTION,
+  TOOL_DESCRIPTION, USER_ASK_PREFIX, adviceBody, consultationPrompt, failureNote, failureQuestion, formatDuration,
+  matchModels, parseConfig, readConfig, resolveModel, reviewMessage, saveModel, serializeTranscript, settingsOf,
+  unavailable, updateConfig, type AdvisorConfig, type Consultation,
 } from "../extensions/core.ts";
-import type { CommandResult, Context, Dispose, LlmService, ToolDefinition, ToolRunContext } from "./types.ts";
+import type { Agent, CommandResult, Context, Dispose, LlmService, ToolDefinition, UserMessage } from "./types.ts";
 
-export const name = "pi-advisor";
+export const name = "secondlook";
 export const inject = ["tools", "llm", "commands", "systemPrompt"];
 
-export interface DshAdvisorConfig {
+/** Message source kind for advisor notes the main model receives. */
+export const SOURCE_KIND = "secondlook";
+
+export interface DshAdvisorConfig extends Partial<Omit<AdvisorConfig, "model">> {
   /** Advisor as provider/model-id. Overrides the saved choice; "off" or null disables. Omit to use the saved choice. */
   model?: string | null;
-  maxTokens?: number;
-  timeoutMs?: number;
-  /** dsh reasoning effort id passed to the adapter; omit for the adapter default. */
-  reasoning?: string;
   /** Where /advisor saves its choice. Defaults to $DSH_HOME/advisor.json (~/.dsh/advisor.json). */
   configPath?: string;
 }
@@ -31,22 +32,19 @@ function parseDshConfig(value: unknown): DshAdvisorConfig {
     if (typeof raw.configPath !== "string" || !raw.configPath.trim()) throw new Error("expected configPath to be a nonempty string");
     result.configPath = raw.configPath;
   }
-  const parsed = parseConfig({ ...raw, model: raw.model === "off" ? null : raw.model ?? null });
-  if (raw.model !== undefined) result.model = parsed.model;
-  if (parsed.maxTokens !== undefined) result.maxTokens = parsed.maxTokens;
-  if (parsed.timeoutMs !== undefined) result.timeoutMs = parsed.timeoutMs;
-  if (parsed.reasoning !== undefined) result.reasoning = parsed.reasoning;
-  return result;
+  const { model, ...tuning } = parseConfig({ ...raw, model: raw.model === "off" ? null : raw.model ?? null });
+  if (raw.model !== undefined) result.model = model;
+  return { ...result, ...tuning };
 }
 
 /** Standard Schema implementation, as Cordis requires for an exported Config. */
 export const Config = {
   "~standard": {
     version: 1 as const,
-    vendor: "pi-advisor",
+    vendor: "secondlook",
     validate(value: unknown) {
       try { return { value: parseDshConfig(value) }; }
-      catch (error) { return { issues: [{ message: `pi-advisor: ${(error as Error).message}` }] }; }
+      catch (error) { return { issues: [{ message: `secondlook: ${(error as Error).message}` }] }; }
     },
   },
 };
@@ -58,11 +56,11 @@ export function defaultConfigPath(env: Record<string, string | undefined> = proc
 
 interface Route { provider: string; model: string }
 
+const routeKey = (route: Route) => `${route.provider}/${route.model}`;
+
 function numericFields(value: object): Record<string, number> {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => typeof entry === "number" && Number.isFinite(entry)));
 }
-
-const routeKey = (route: Route) => `${route.provider}/${route.model}`;
 
 /** Split provider/model using registered provider routes; model ids may contain slashes. */
 function splitRoute(spec: string, providers: readonly string[]): Route | undefined {
@@ -95,28 +93,33 @@ async function resolveRoute(llm: LlmService, spec: string, signal?: AbortSignal)
   return { provider: match.provider, model: match.id };
 }
 
+function note(text: string): UserMessage {
+  return { role: "user", id: randomUUID(), content: [{ type: "text", text }], source: { kind: SOURCE_KIND } };
+}
+
+const USAGE = "Usage: /advisor provider/model-id | list [filter] | ask <question> | review on|off | failures <n>|off | limit <n>|off | off | status";
+
+type Details = { usage?: Record<string, number> };
+
 export function apply(ctx: Context, config: DshAdvisorConfig = {}) {
   const configPath = config.configPath ?? defaultConfigPath();
+  const { model: configModel, configPath: _path, ...configTuning } = config;
   let saved: AdvisorConfig = { model: null };
   let configError: string | undefined;
   try { saved = readConfig(configPath); }
-  catch (error) { configError = (error as Error).message; console.warn(`[pi-advisor] ${configError}`); }
+  catch (error) { configError = (error as Error).message; console.warn(`[secondlook] ${configError}`); }
 
-  let selected: string | null = config.model !== undefined ? config.model : saved.model;
-  let tuning: AdvisorConfig = { ...saved, ...config, model: selected };
-  const tally = new UsageTally();
-  const busy = new Set<string>();
-  const controllers = new Set<AbortController>();
-  let generation = 0;
+  let selected: string | null = configModel !== undefined ? configModel : saved.model;
+  let tuning: Partial<AdvisorConfig> = { ...saved, ...configTuning };
+  const consultant = new Consultant();
+  // Per session: tool calls since the last turn end, consecutive failures, and the last reviewed turn.
+  const toolCalls = new Map<string, number>();
+  const failures = new Map<string, number>();
+  const reviewedTurn = new Map<string, number>();
   let disposeTool: Dispose | undefined;
 
   const limits = () => settingsOf(tuning);
   const reasoningEffort = () => tuning.reasoning && tuning.reasoning !== "off" ? tuning.reasoning : undefined;
-
-  function cancelInFlight() {
-    generation++;
-    for (const controller of controllers) controller.abort();
-  }
 
   function currentRoute(): Route {
     if (!selected) throw new Error("advisor is off");
@@ -125,57 +128,51 @@ export function apply(ctx: Context, config: DshAdvisorConfig = {}) {
     return route;
   }
 
-  async function consult(question: string, exec: ToolRunContext): Promise<Advice & { model: string | null; usage?: Record<string, number> }> {
-    const modelSpec = selected;
-    if (!modelSpec) return { ...unavailable("advisor is off; ask the user to configure /advisor"), model: null };
-    const sessionId = exec.agent.session.id;
-    if (busy.has(sessionId)) return { ...unavailable("another advisor consultation is in progress"), model: modelSpec };
-    const requestGeneration = generation;
-    const { maxTokens, timeoutMs } = limits();
-    const controller = new AbortController();
-    const combined = AbortSignal.any([controller.signal, exec.signal, AbortSignal.timeout(timeoutMs)]);
-    busy.add(sessionId);
-    controllers.add(controller);
-    try {
-      const route = currentRoute();
-      combined.throwIfAborted();
-      const prompt = consultationPrompt({ transcript: serializeTranscript(exec.agent.session.deriveMessages()), question });
-      const effort = reasoningEffort();
-      const texts = new Map<number, string>();
-      let finish: { kind: string; failure?: { message: string } } | undefined;
-      let usage: Record<string, number> | undefined;
-      for await (const chunk of ctx.llm.stream({
-        provider: route.provider,
-        model: route.model,
-        system: ADVISOR_SYSTEM,
-        messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
-        maxTokens,
-        signal: combined,
-        sessionId,
-        ...(effort ? { reasoningEffort: effort } : {}),
-      })) {
-        if (chunk.type === "text-delta") texts.set(chunk.index, (texts.get(chunk.index) ?? "") + chunk.text);
-        else if (chunk.type === "block-end" && chunk.block.type === "text" && typeof chunk.block.text === "string") texts.set(chunk.index, chunk.block.text);
-        else if (chunk.type === "usage") usage = numericFields(chunk.usage);
-        else if (chunk.type === "finish") finish = chunk.reason;
-      }
-      if (combined.aborted || generation !== requestGeneration) throw new Error("consultation cancelled or advisor configuration changed");
-      if (!finish) throw new Error("model stream ended without finishing");
-      if (finish.kind === "error" || finish.kind === "aborted") throw new Error(finish.failure?.message || finish.kind);
-      tally.add({ input: (usage?.inputTokens ?? 0) + (usage?.cacheReadTokens ?? 0) + (usage?.cacheWriteTokens ?? 0), output: usage?.outputTokens });
-      const text = [...texts.entries()].sort(([a], [b]) => a - b).map(([, value]) => value).join("\n");
-      return { ...interpretAdvice(routeKey(route), text, finish.kind === "max-tokens"), model: routeKey(route), ...(usage ? { usage } : {}) };
-    } catch (error) {
-      const timedOut = combined.aborted && !controller.signal.aborted && !exec.signal.aborted;
-      // Let the registry record a caller cancellation as a tool abort.
-      if (exec.signal.aborted) throw exec.signal.reason ?? error;
-      const reason = timedOut ? `timed out after ${formatDuration(timeoutMs)}`
-        : combined.aborted ? "consultation cancelled" : (error as Error).message;
-      return { ...unavailable(reason), model: modelSpec };
-    } finally {
-      busy.delete(sessionId);
-      controllers.delete(controller);
-    }
+  /** Run one consultation over the agent's derived history. Never throws unless asked to rethrow a caller abort. */
+  async function consult(agent: Agent, question: string, options: { context?: string; signal?: AbortSignal; rethrow?: boolean } = {}): Promise<Consultation<Details>> {
+    if (!selected) return { ...unavailable("advisor is off; ask the user to configure /advisor"), model: "off" };
+    let route: Route;
+    try { route = currentRoute(); }
+    catch (error) { return { ...unavailable((error as Error).message), model: selected }; }
+    const { maxTokens, timeoutMs, maxConsultations } = limits();
+    const effort = reasoningEffort();
+    return consultant.consult<Details>({
+      key: agent.session.id,
+      model: routeKey(route),
+      timeoutMs,
+      maxConsultations,
+      signal: options.signal,
+      rethrowCallerAbort: options.rethrow,
+      call: async (signal) => {
+        const prompt = consultationPrompt({ transcript: serializeTranscript(agent.session.deriveMessages()), question, context: options.context });
+        const texts = new Map<number, string>();
+        let finish: { kind: string; failure?: { message: string } } | undefined;
+        let usage: Record<string, number> | undefined;
+        for await (const chunk of ctx.llm.stream({
+          provider: route.provider,
+          model: route.model,
+          system: ADVISOR_SYSTEM,
+          messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+          maxTokens,
+          signal,
+          sessionId: agent.session.id,
+          ...(effort ? { reasoningEffort: effort } : {}),
+        })) {
+          if (chunk.type === "text-delta") texts.set(chunk.index, (texts.get(chunk.index) ?? "") + chunk.text);
+          else if (chunk.type === "block-end" && chunk.block.type === "text" && typeof chunk.block.text === "string") texts.set(chunk.index, chunk.block.text);
+          else if (chunk.type === "usage") usage = numericFields(chunk.usage);
+          else if (chunk.type === "finish") finish = chunk.reason;
+        }
+        if (!finish) throw new Error("model stream ended without finishing");
+        if (finish.kind === "error" || finish.kind === "aborted") throw new Error(finish.failure?.message || finish.kind);
+        return {
+          text: [...texts.entries()].sort(([a], [b]) => a - b).map(([, value]) => value).join("\n"),
+          truncated: finish.kind === "max-tokens",
+          usage: { input: (usage?.inputTokens ?? 0) + (usage?.cacheReadTokens ?? 0) + (usage?.cacheWriteTokens ?? 0), output: usage?.outputTokens },
+          details: usage ? { usage } : {},
+        };
+      },
+    });
   }
 
   const tool: ToolDefinition = {
@@ -183,7 +180,10 @@ export function apply(ctx: Context, config: DshAdvisorConfig = {}) {
     description: TOOL_DESCRIPTION,
     parameters: {
       type: "object",
-      properties: { question: { type: "string", description: QUESTION_DESCRIPTION } },
+      properties: {
+        question: { type: "string", description: QUESTION_DESCRIPTION },
+        context: { type: "string", description: CONTEXT_DESCRIPTION },
+      },
       required: ["question"],
       additionalProperties: false,
     },
@@ -207,11 +207,21 @@ export function apply(ctx: Context, config: DshAdvisorConfig = {}) {
       return { card: "generic", title: "Advisor", ...(typeof question === "string" ? { content: [{ type: "text", text: question }] } : {}) };
     },
     async execute(args, exec) {
-      const question = (args as { question?: unknown } | null)?.question;
+      const { question, context } = (args ?? {}) as { question?: unknown; context?: unknown };
       if (typeof question !== "string" || !question.trim()) {
         return { ...unavailable("the question argument must be a nonempty string"), model: selected };
       }
-      return consult(question.trim(), exec);
+      const advice = await consult(exec.agent, question.trim(), {
+        context: typeof context === "string" ? context : undefined,
+        signal: exec.signal,
+        rethrow: true,
+      });
+      return {
+        status: advice.status,
+        model: advice.model === "off" ? null : advice.model,
+        text: advice.text,
+        ...(advice.details?.usage ? { usage: advice.details.usage } : {}),
+      };
     },
   };
 
@@ -223,38 +233,116 @@ export function apply(ctx: Context, config: DshAdvisorConfig = {}) {
   let order = 2850;
   try { order = ctx.systemPrompt.getSectionOrder("TOOL_SUBAGENT") + 50; } catch { /* keep the fallback position */ }
   ctx.systemPrompt.section({
-    name: "pi-advisor:guidance",
+    name: "secondlook:guidance",
     order,
     interpolate: false,
     replacement: "",
     text: () => selected ? ADVISOR_GUIDANCE : "",
   });
 
-  function describe(): string {
-    const { maxTokens, timeoutMs } = limits();
+  // Count tool calls and consult automatically after repeated failures; the advice
+  // reaches the model as context right after the failing result.
+  ctx.on("tools/post-execute", async (exec, result, next) => {
+    const decision = await next();
+    const agent = exec.agent;
+    if (!agent || exec.name === "advisor") return decision;
+    const key = agent.session.id;
+    toolCalls.set(key, (toolCalls.get(key) ?? 0) + 1);
+    if (!result.isError) { failures.set(key, 0); return decision; }
+    const count = (failures.get(key) ?? 0) + 1;
+    failures.set(key, count);
+    const threshold = limits().autoOnFailures;
+    if (!selected || threshold <= 0 || count < threshold) return decision;
+    failures.set(key, 0);
+    const error = result.content.map((block) => block.type === "text" ? block.text ?? "" : `[${block.type}]`).join("\n");
+    const advice = await consult(agent, failureQuestion(count, exec.name, error), { signal: exec.signal });
+    if (advice.status !== "reviewed") return decision;
+    return { ...decision, additionalContexts: [...(decision.additionalContexts ?? []), note(failureNote(count, advice.text).trim())] };
+  });
+
+  // Review once per turn before it closes; gaps are steered back as one more step.
+  ctx.on("agent/turn-stopping", async ({ agent, turn, signal }) => {
+    const key = agent.session.id;
+    const calls = toolCalls.get(key) ?? 0;
+    toolCalls.set(key, 0);
+    failures.set(key, 0);
+    const { autoReview, reviewMinToolCalls } = limits();
+    if (!selected || !autoReview || reviewedTurn.get(key) === turn || calls < reviewMinToolCalls) return;
+    if (agent.session.header?.origin === "subagent") return;
+    reviewedTurn.set(key, turn);
+    const advice = await consult(agent, REVIEW_QUESTION, { signal });
+    if (advice.verdict === "needs_work" && !signal.aborted) agent.steer(note(reviewMessage(advice.model, advice.text)));
+  });
+
+  function describe(sessionId: string): string {
+    const settings = limits();
     const lines = [`Advisor: ${selected ?? "off"}`];
-    if (selected) lines.push(`Limits: ${maxTokens} output tokens, ${formatDuration(timeoutMs)}, reasoning ${reasoningEffort() ?? "adapter default"}`);
-    if (config.model !== undefined) lines.push("The model is set in cordis.yml; /advisor changes apply to this process and the saved default.");
-    lines.push(tally.describe());
+    if (selected) {
+      lines.push(`Limits: ${settings.maxTokens} output tokens, ${formatDuration(settings.timeoutMs)}, reasoning ${reasoningEffort() ?? "adapter default"}`);
+      lines.push(`Auto review before finishing: ${settings.autoReview ? `on (turns with ${settings.reviewMinToolCalls}+ tool calls)` : "off"}`);
+      lines.push(`Auto consult after failures: ${settings.autoOnFailures ? `${settings.autoOnFailures} in a row` : "off"}`);
+      const used = consultant.used(sessionId);
+      lines.push(`Session limit: ${settings.maxConsultations ? `${used}/${settings.maxConsultations}` : `${used} used, unlimited`}`);
+    }
+    if (configModel !== undefined) lines.push("The model is set in cordis.yml; /advisor changes apply to this process and the saved default.");
+    lines.push(consultant.tally.describe());
     if (configError) lines.push(configError);
     return lines.join("\n");
   }
 
-  async function command(input: string, signal: AbortSignal): Promise<CommandResult> {
-    const [verb, ...rest] = input.trim().split(/\s+/);
-    if (!verb || verb === "status") return { kind: "success", text: `${describe()}\n\nUsage: /advisor provider/model-id | list [filter] | off | status` };
+  async function setOption(patch: Partial<AdvisorConfig>, message: string): Promise<CommandResult> {
+    try {
+      saved = await updateConfig(configPath, patch);
+      tuning = { ...saved, ...configTuning, ...patch };
+      configError = undefined;
+      return { kind: "success", text: message };
+    } catch (error) {
+      return { kind: "error", text: (error as Error).message };
+    }
+  }
+
+  function parseCount(value: string): number | undefined {
+    if (value === "off") return 0;
+    const count = Number(value);
+    return Number.isInteger(count) && count > 0 ? count : undefined;
+  }
+
+  async function command(input: string, agent: Agent, signal: AbortSignal): Promise<CommandResult> {
+    const trimmed = input.trim();
+    const [verb = "", ...rest] = trimmed.split(/\s+/);
+    const value = rest.join(" ");
+    if (!verb || verb === "status") return { kind: "success", text: `${describe(agent.session.id)}\n\n${USAGE}` };
     if (verb === "list") {
       const keys = (await listAll(ctx.llm, signal)).map((model) => `${model.provider}/${model.id}`).sort();
-      const shown = matchModels(rest.join(" "), keys, 200);
+      const shown = matchModels(value, keys, 200);
       return { kind: "success", text: shown.length ? shown.join("\n") : "No models matched." };
     }
+    if (verb === "ask") {
+      if (!value) return { kind: "error", text: "Usage: /advisor ask <question>" };
+      const advice = await consult(agent, `${USER_ASK_PREFIX}${value}`, { signal });
+      return advice.status === "unavailable"
+        ? { kind: "error", text: advice.text }
+        : { kind: "success", text: `Advisor (${advice.model}):\n\n${adviceBody(advice.text)}` };
+    }
+    if (verb === "review") {
+      if (value !== "on" && value !== "off") return { kind: "error", text: "Usage: /advisor review on|off" };
+      return setOption({ autoReview: value === "on" }, `Automatic review before finishing: ${value}`);
+    }
+    if (verb === "failures" || verb === "limit") {
+      const count = parseCount(value);
+      if (count === undefined) return { kind: "error", text: `Usage: /advisor ${verb} <positive integer>|off` };
+      return verb === "failures"
+        ? setOption({ autoOnFailures: count }, `Automatic consultation after failures: ${count ? `${count} in a row` : "off"}`)
+        : setOption({ maxConsultations: count }, `Consultations per session: ${count || "unlimited"}`);
+    }
+    if (rest.length && !trimmed.includes("/")) return { kind: "error", text: USAGE };
     try {
-      const next = verb === "off" ? null : routeKey(await resolveRoute(ctx.llm, input.trim(), signal));
-      const saved = await saveModel(configPath, next);
+      const next = verb === "off" ? null : routeKey(await resolveRoute(ctx.llm, trimmed, signal));
+      saved = await saveModel(configPath, next);
       selected = next;
-      tuning = { ...saved, ...config, model: next };
+      tuning = { ...saved, ...configTuning };
       configError = undefined;
-      cancelInFlight();
+      consultant.cancelAll();
       syncTool();
       return { kind: "success", text: next ? `Advisor set to ${next}. Consultations share the current conversation and use additional tokens.` : "Advisor off" };
     } catch (error) {
@@ -263,13 +351,13 @@ export function apply(ctx: Context, config: DshAdvisorConfig = {}) {
   }
 
   ctx.commands.register({
-    definitionId: "pi-advisor/advisor",
+    definitionId: "secondlook/advisor",
     name: "advisor",
-    description: "Choose an advisor model, list models, show status, or turn off",
-    input: { hint: "provider/model-id | list | off | status" },
-    handler: (invocation) => command(invocation.rawInput, invocation.signal),
+    description: "Choose an advisor, ask it a question, or configure automatic reviews",
+    input: { hint: "provider/model-id | list | ask <question> | review on|off | failures <n>|off | off | status" },
+    handler: (invocation) => command(invocation.rawInput, invocation.agent, invocation.signal),
   });
 
   syncTool();
-  ctx.effect(() => () => { cancelInFlight(); }, "pi-advisor in-flight consultations");
+  ctx.effect(() => () => { consultant.cancelAll(); }, "secondlook in-flight consultations");
 }

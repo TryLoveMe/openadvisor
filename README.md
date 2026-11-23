@@ -1,10 +1,10 @@
 <div align="center">
 
-<img src="assets/icon.svg" width="80" height="80" alt="Pi Advisor">
+<img src="assets/icon.svg" width="80" height="80" alt="secondlook">
 
-# Pi Advisor
+# secondlook
 
-**给你的编码 Agent 配一位"顾问"——关键时刻，先听听第二意见。**
+**让另一个模型再看一眼——给你的编码 Agent 配一位顾问，关键时刻先听听第二意见。**
 
 适用于 [Pi](https://pi.dev) 与 [DeepSeek Harness（dsh）](https://github.com/deepseek-ai/deepseek-harness)
 
@@ -18,6 +18,12 @@
 </div>
 
 ---
+
+<p align="center">
+  <img src="assets/demo.svg" width="860" alt="示意图：测试连续失败 3 次后 secondlook 自动指出根因；收尾前审查发现超时路径未测试，主模型补上后结束">
+  <br>
+  <sub>示意图（非真实截图）：连续失败后自动求助，收尾前自动审查</sub>
+</p>
 
 在主模型需要**规划方案**、**排查反复出现的错误**或**检查是否真正完成**时，它可以调用 `advisor` 工具，把当前对话交给另一个模型审阅，拿到建议后再自己继续干活。
 
@@ -40,10 +46,14 @@ sequenceDiagram
 
 - 🔌 **一个包，两个宿主**：同时是 Pi 扩展和 dsh 插件包，两端共用同一套核心逻辑。
 - 🧠 **主模型自己决定何时咨询**：不会每轮都问，按需调用；你也可以在提示里直接要求它咨询。
+- ✅ **收尾前自动审查（可选）**：主模型准备交差时，顾问先检查是否真的完成；发现缺口就让主模型补上再结束。
+- 🔁 **卡住时自动求助（可选）**：工具连续失败 N 次后自动咨询，建议直接附在失败结果后面。
+- 🙋 **你也能直接问**：`/advisor ask <问题>` 让顾问以旁观者身份回答你，不进入主模型的上下文。
+- 📎 **附带证据**：主模型可以把对话里没有的 diff、代码、完整报错作为 `context` 一起发给顾问。
 - 🔒 **顾问只提建议**：顾问没有文件、终端或任何工具权限。
 - 🪶 **省 token**：对话以紧凑 JSON 发送，去掉用量、时间戳、签名等对模型无用的附加信息；工具参数和结果保持完整。
 - 📊 **用量可见**：`/advisor status` 显示累计咨询次数、token 与费用。
-- ⏱️ **可控**：超时、输出上限、推理强度都可配置；支持取消，失败时给出明确信息，不会让主模型误以为已经审阅过。
+- ⏱️ **可控**：超时、输出上限、推理强度、每个会话的咨询次数上限都可配置；支持取消，失败时给出明确信息，不会让主模型误以为已经审阅过。
 
 ## 快速开始
 
@@ -71,9 +81,9 @@ pi install .
 需要 dsh 0.2.x、Node.js 24.22.3+ 和 pnpm
 
 ```bash
-git clone https://github.com/TryLoveMe/pi-advisor.git
-cd pi-advisor && npm install   # 生成 dist/
-dsh plugin --profile web add ./pi-advisor
+git clone https://github.com/TryLoveMe/secondlook.git
+cd secondlook && npm install   # 生成 dist/
+dsh plugin --profile web add ./secondlook
 dsh web
 ```
 
@@ -100,11 +110,16 @@ dsh web
 | `/advisor <provider>/<model-id>` | ✅ | ✅ | 选择顾问模型并保存 |
 | `/advisor <model-id>` | ✅ | ✅ | ID 没有歧义时可省略 provider |
 | `/advisor list [过滤词]` | — | ✅ | 列出可用模型（dsh 的命令没有选择菜单） |
-| `/advisor status` | ✅ | ✅ | 当前模型、限额与累计用量 |
+| `/advisor ask <问题>` | ✅ | ✅ | 你直接问顾问，答案只给你看 |
+| `/advisor review on\|off` | ✅ | ✅ | 收尾前自动审查 |
+| `/advisor failures <n>\|off` | ✅ | ✅ | 连续失败 n 次后自动咨询 |
+| `/advisor limit <n>\|off` | ✅ | ✅ | 每个会话最多咨询 n 次 |
+| `/advisor status` | ✅ | ✅ | 当前模型、自动功能、限额与累计用量 |
 | `/advisor off` | ✅ | ✅ | 关闭顾问 |
 
 - 默认**关闭**。选择会跨会话保存。
-- Pi 中 `/advisor` 支持 **Tab 补全**模型名；模型 ID 以 `pi --list-models` 为准。
+- 设置类命令（`review`、`failures`、`limit`）同样会保存。
+- Pi 中 `/advisor` 支持 **Tab 补全**子命令和模型名；模型 ID 以 `pi --list-models` 为准。
 - 不提供 `opus` 这类会随版本漂移的简称，也不推断模型强弱。
 
 ### 让主模型去咨询
@@ -116,7 +131,38 @@ dsh web
 完成后请让 advisor 检查测试证据，指出遗漏。
 ```
 
+主模型调用时可以带上 `context` 参数，附上对话里没有的证据（diff、相关代码、完整报错）——顾问读不了文件，这能显著提升建议质量。工具指引里已经提醒主模型这样做。
+
 工具结果会标明 **`Reviewed`**（已审阅）、**`Declined`**（顾问拒绝回答）或 **`Advisor unavailable`**（调用失败），可展开查看完整建议。Pi 中咨询期间状态栏显示 `Advising`。
+
+### 自动审查与自动求助
+
+两个功能默认关闭，开启后对之后的请求生效：
+
+```text
+/advisor review on       # 收尾前自动审查
+/advisor failures 3      # 连续 3 次工具失败后自动咨询
+/advisor limit 20        # 建议同时设上限，控制费用
+```
+
+**收尾前审查**：主模型准备结束本次请求时，顾问判断请求是否真的完成，第一行给出 `VERDICT: COMPLETE` 或 `VERDICT: NEEDS_WORK`。
+
+- `COMPLETE`：直接结束，Pi 中会提示"审查通过"。
+- `NEEDS_WORK`：把缺口清单交给主模型，主模型核对、补上后再结束。
+- 每个请求**最多审查一次**，不会无限循环；工具调用少于 `reviewMinToolCalls`（默认 3）次的简单请求、出错或被中断的请求、dsh 的子 Agent 都会跳过。
+
+**失败后求助**：工具连续失败达到设定次数时，顾问根据对话和最新报错分析根因，建议直接附在这次失败的结果后面（dsh 中作为紧随其后的上下文），主模型下一步就能看到。成功一次就重新计数，咨询过后也重新计数。
+
+> [!NOTE]
+> 自动功能与手动调用共用每个会话的次数上限（`limit`）。审查和求助本身失败时不会打断任务，只会提示。
+
+### 你直接问顾问
+
+```text
+/advisor ask 它是不是跑偏了？现在的做法有什么风险？
+```
+
+顾问会看到当前完整对话，以旁观者身份回答你。答案只显示给你，**不会**进入主模型的上下文，也不会打断它的工作。
 
 ### 只对当前进程生效的覆盖
 
@@ -138,12 +184,15 @@ pi --advisor off
 在 profile 的 `cordis.patch.yml` 中加入：
 
 ```yaml
-- id: pi-advisor
-  name: pi-advisor/dsh
+- id: secondlook
+  name: secondlook/dsh
   config:
     model: deepseek-official/<model-id>   # off 表示关闭；省略则使用保存的选择
     maxTokens: 4096
     timeoutMs: 120000
+    autoReview: true
+    autoOnFailures: 3
+    maxConsultations: 20
     # reasoning: high                     # dsh 推理强度 ID，省略则用适配器默认
     # configPath: /path/to/advisor.json   # 自定义保存位置
 ```
@@ -166,7 +215,11 @@ pi --advisor off
   "model": "anthropic/claude-opus-4-6",
   "maxTokens": 4096,
   "timeoutMs": 120000,
-  "reasoning": "high"
+  "reasoning": "high",
+  "autoReview": true,
+  "reviewMinToolCalls": 3,
+  "autoOnFailures": 3,
+  "maxConsultations": 20
 }
 ```
 
@@ -176,8 +229,12 @@ pi --advisor off
 | `maxTokens` | `4096` | 顾问输出上限，同时不超过模型自身上限 |
 | `timeoutMs` | `120000` | 单次咨询的最长时间，最多 30 分钟 |
 | `reasoning` | Pi：`high`<br>dsh：适配器默认 | 推理强度，只对支持推理的模型生效；`off` 表示关闭 |
+| `autoReview` | `false` | 收尾前自动审查 |
+| `reviewMinToolCalls` | `3` | 工具调用少于这个数的请求不审查 |
+| `autoOnFailures` | `0` | 连续失败几次后自动咨询，`0` 表示关闭 |
+| `maxConsultations` | `0` | 每个会话最多咨询几次（含自动），`0` 表示不限 |
 
-除 `model` 外都可以省略。`/advisor` 切换模型时只改 `model`，其他字段保留。配置文件无效时会提示警告并保持关闭，重新运行 `/advisor` 即可保存一份有效配置。
+除 `model` 外都可以省略。`/advisor` 的各个子命令只改对应字段，其他字段保留。配置文件无效时会提示警告并保持关闭，重新运行 `/advisor` 即可保存一份有效配置。
 
 ## 上下文、费用与限制
 
@@ -200,6 +257,7 @@ pi --advisor off
 **可靠性**
 
 - 输出达到上限时会明确提示"可能不完整"，超时会明确标注为超时。
+- 开启自动审查后，每个触发审查的请求会多一次顾问调用；审查判定需要补充时，主模型还会多工作一轮。建议同时设置 `limit`。
 - 支持取消：切换或关闭顾问、切换会话、卸载插件都会取消进行中的咨询。
 - 同一会话同时只进行一次咨询；失败不会自动重试，主模型收到可读的错误后继续工作。
 
@@ -223,7 +281,7 @@ dsh/
 dist/            npm run build 的产物，纯 JavaScript，供 dsh 加载
 ```
 
-测试覆盖配置保存与校验、模型解析与补全、启用/关闭、对话传递与精简、限额与用量统计、错误/拒绝/截断/超时、取消时丢弃过期建议、dsh 插件的工具/命令/系统提示注册，以及构建产物能否在纯 Node 下加载。**不需要真实 API 凭据。**
+测试覆盖配置保存与校验、模型解析与补全、启用/关闭、对话与附加证据的传递、`/advisor ask`、自动审查（只审一次、跳过小请求和子 Agent）、失败后自动求助、会话上限、错误/拒绝/截断/超时、取消时丢弃过期建议、dsh 插件的工具/命令/钩子注册，以及构建产物能否在纯 Node 下加载。**不需要真实 API 凭据。**
 
 ## 许可证
 

@@ -17,6 +17,8 @@ function harness(config: Record<string, unknown> = {}) {
   let section: any;
   let disposed = 0;
   const effects: Function[] = [];
+  const listeners: Record<string, Function> = {};
+  const steered: any[] = [];
   const calls: GenerateOptions[] = [];
   let script: Script = [
     { type: "block-start", index: 0, blockType: "text" },
@@ -45,18 +47,24 @@ function harness(config: Record<string, unknown> = {}) {
       },
     },
     effect: (execute: () => Function | void) => { const dispose = execute(); if (dispose) effects.push(dispose); },
+    on: (event: string, listener: Function) => { listeners[event] = listener; return () => {}; },
   };
   const session = { id: "s1", deriveMessages: () => [
     { role: "system", id: "m0", content: [{ type: "text", text: "Main instructions" }] },
     { role: "user", id: "m1", source: { kind: "user" }, content: [{ type: "text", text: "Fix the bug" }] },
   ] };
+  const agent = { id: "s1", session, steer: (message: any) => steered.push(message) };
   apply(ctx as any, { configPath, ...config } as any);
   return {
     ctx, calls, directory, configPath,
     get tool() { return tool; }, get section() { return section; }, get disposed() { return disposed; },
-    command: (input: string, signal = new AbortController().signal) => command.handler({ rawInput: input, signal, agent: { id: "s1", session } }),
-    execute: (signal = new AbortController().signal, question = "What did I miss?") =>
-      tool!.execute({ question }, { agent: { id: "s1", session }, signal }) as Promise<any>,
+    agent, steered, listeners,
+    command: (input: string, signal = new AbortController().signal) => command.handler({ rawInput: input, signal, agent }),
+    execute: (signal = new AbortController().signal, question = "What did I miss?", context?: string) =>
+      tool!.execute({ question, ...(context ? { context } : {}) }, { agent, signal }) as Promise<any>,
+    toolResult: (name: string, isError: boolean, text = "boom", signal = new AbortController().signal) =>
+      listeners["tools/post-execute"]({ name, agent, signal }, { isError, content: [{ type: "text", text }] }, async () => ({ kind: "accept" })),
+    stopTurn: (turn: number, signal = new AbortController().signal) => listeners["agent/turn-stopping"]({ agent, turn, signal }),
     script: (value: Script) => { script = value; },
     unload: () => effects.forEach((dispose) => dispose()),
     cleanup: () => rmSync(directory, { recursive: true, force: true }),
@@ -184,5 +192,61 @@ test("built plugin loads under plain Node without TypeScript tooling", () => {
     "const m = await import('./dist/dsh/index.js'); console.log(m.name, typeof m.apply, typeof m.Config['~standard'].validate)"],
   { encoding: "utf8" });
   assert.equal(output.status, 0, output.stderr);
-  assert.equal(output.stdout.trim(), "pi-advisor function function");
+  assert.equal(output.stdout.trim(), "secondlook function function");
+});
+
+test("dsh: context argument, /advisor ask, and session limit", async () => {
+  const h = harness({ model: "deepseek/deepseek-reasoner" });
+  try {
+    await h.execute(undefined, "Safe?", "stack trace here");
+    assert.match(h.calls[0].messages[0].content[0].text, /Additional context supplied by the agent[\s\S]*stack trace here/);
+    const asked = await h.command("ask are we done?");
+    assert.equal(asked.kind, "success");
+    assert.equal(asked.text, "Advisor (deepseek/deepseek-reasoner):\n\nCheck the boundary.");
+    assert.match(h.calls[1].messages[0].content[0].text, /The user \(not the agent\)/);
+    assert.equal((await h.command("limit 2")).kind, "success");
+    assert.match((await h.execute()).text, /consultation limit/);
+    assert.equal(JSON.parse(readFileSync(h.configPath, "utf8")).maxConsultations, 2);
+  } finally { h.cleanup(); }
+});
+
+test("dsh: auto review steers once per turn and skips small turns and subagents", async () => {
+  const h = harness({ model: "deepseek/deepseek-reasoner", autoReview: true, reviewMinToolCalls: 2 });
+  try {
+    await h.toolResult("bash", false);
+    await h.stopTurn(1);
+    assert.equal(h.calls.length, 0, "one tool call is below the minimum");
+    h.script([{ type: "text-delta", index: 0, text: "VERDICT: NEEDS_WORK\n- run the tests" }, { type: "finish", reason: { kind: "stop" } }]);
+    await h.toolResult("bash", false); await h.toolResult("edit", false);
+    await h.stopTurn(2);
+    assert.equal(h.steered.length, 1);
+    assert.equal(h.steered[0].source.kind, "secondlook");
+    assert.match(h.steered[0].content[0].text, /found gaps[\s\S]*run the tests/);
+    await h.toolResult("bash", false); await h.toolResult("bash", false);
+    await h.stopTurn(2);
+    assert.equal(h.steered.length, 1, "the same turn is reviewed once");
+    h.script([{ type: "text-delta", index: 0, text: "VERDICT: COMPLETE" }, { type: "finish", reason: { kind: "stop" } }]);
+    await h.toolResult("bash", false); await h.toolResult("bash", false);
+    await h.stopTurn(3);
+    assert.equal(h.steered.length, 1, "complete verdicts do not steer");
+    (h.agent.session as any).header = { origin: "subagent" };
+    await h.toolResult("bash", false); await h.toolResult("bash", false);
+    await h.stopTurn(4);
+    assert.equal(h.calls.length, 2);
+    assert.equal((await h.command("review off")).kind, "success");
+  } finally { h.cleanup(); }
+});
+
+test("dsh: repeated failures attach advice as additional context", async () => {
+  const h = harness({ model: "deepseek/deepseek-reasoner", autoOnFailures: 2 });
+  try {
+    assert.deepEqual(await h.toolResult("bash", true, "first"), { kind: "accept" });
+    const decision = await h.toolResult("bash", true, "exit code 127");
+    assert.equal(decision.kind, "accept");
+    assert.equal(decision.additionalContexts.length, 1);
+    assert.match(decision.additionalContexts[0].content[0].text, /^\[Advisor, after 2 consecutive tool failures\]\nCheck the boundary\./);
+    assert.match(h.calls[0].messages[0].content[0].text, /exit code 127/);
+    assert.deepEqual(await h.toolResult("advisor", true), { kind: "accept" }, "the advisor tool itself is ignored");
+    assert.equal(h.calls.length, 1);
+  } finally { h.cleanup(); }
 });

@@ -10,7 +10,7 @@ import { matchModels, readConfig, resolveModel, saveConfig, saveModel, serialize
 const model = { provider: "test", id: "strong", maxTokens: 8192, reasoning: true };
 
 function harness(flag?: string) {
-  const directory = mkdtempSync(join(tmpdir(), "pi-advisor-test-"));
+  const directory = mkdtempSync(join(tmpdir(), "secondlook-test-"));
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = directory;
   const hooks: Record<string, Function> = {};
@@ -224,7 +224,8 @@ test("command completions offer subcommands and filter models", async () => {
   const h = harness();
   try {
     await h.hooks.session_start({}, h.ctx);
-    assert.deepEqual((await h.complete("")).map((item: any) => item.value), ["off", "status", "test/strong"]);
+    const all = (await h.complete("")).map((item: any) => item.value);
+    assert.ok(all.includes("off") && all.includes("review on") && all.includes("test/strong"));
     assert.deepEqual((await h.complete("STR")).map((item: any) => item.value), ["test/strong"]);
     assert.equal(await h.complete("zzz"), null);
     assert.deepEqual(matchModels("o", ["b/o", "off"]), ["off", "b/o"]);
@@ -259,5 +260,102 @@ test("timeouts are reported as such", async () => {
     h.answer((_model: unknown, _context: unknown, options: any) => new Promise((_, reject) =>
       options.signal.addEventListener("abort", () => reject(new Error("aborted")))));
     assert.match((await h.execute()).content[0].text, /timed out after 20ms/);
+  } finally { h.cleanup(); }
+});
+
+function settle(h: any, overrides: Record<string, unknown> = {}) {
+  return h.hooks.agent_before_settle({ type: "agent_before_settle", entries: [], continue: false, outcome: "completed",
+    context: { canContinue: false }, ...overrides }, h.ctx);
+}
+
+test("tool context is sent to the advisor", async () => {
+  const h = harness("test/strong");
+  try {
+    await h.hooks.session_start({}, h.ctx);
+    await h.tool.execute("call", { question: "Is this safe?", context: "diff --git a/x b/x" }, undefined, undefined, h.ctx);
+    const prompt = h.calls[0][1].messages[0].content;
+    assert.match(prompt, /Additional context supplied by the agent[\s\S]*diff --git a\/x b\/x[\s\S]*Is this safe\?/);
+  } finally { h.cleanup(); }
+});
+
+test("/advisor ask answers the user without touching the conversation", async () => {
+  const h = harness("test/strong");
+  try {
+    await h.hooks.session_start({}, h.ctx);
+    await h.command("ask is the agent on track?");
+    assert.match(h.calls[0][1].messages[0].content, /The user \(not the agent\) is asking[\s\S]*is the agent on track\?/);
+    assert.equal(h.notices.at(-1), "Advisor (test/strong):\n\nCheck the boundary condition.");
+    await h.command("ask");
+    assert.match(h.notices.at(-1)!, /Usage/);
+  } finally { h.cleanup(); }
+});
+
+test("auto review: needs_work continues once, complete only notifies, small requests are skipped", async () => {
+  const h = harness("test/strong");
+  try {
+    await h.hooks.session_start({}, h.ctx);
+    await h.command("review on");
+    assert.equal(JSON.parse(readFileSync(join(h.directory, "advisor.json"), "utf8")).autoReview, true);
+    await h.hooks.before_agent_start({ messageType: "user", systemPrompt: "x" });
+    for (let i = 0; i < 2; i++) await h.hooks.tool_execution_end({ toolName: "bash" });
+    assert.equal(await settle(h), undefined, "below reviewMinToolCalls");
+    assert.equal(h.calls.length, 0);
+    await h.hooks.tool_execution_end({ toolName: "bash" });
+    h.answer({ content: [{ type: "text", text: "VERDICT: NEEDS_WORK\n- tests were never run" }], stopReason: "stop" });
+    const result = await settle(h);
+    assert.equal(result.continue, true);
+    assert.equal(result.entries[0].customType, "advisor-review");
+    assert.match(result.entries[0].content, /found gaps[\s\S]*tests were never run/);
+    assert.match(h.calls[0][1].messages[0].content, /VERDICT: COMPLETE/);
+    assert.equal(await settle(h), undefined, "only one review per request");
+    await h.hooks.before_agent_start({ messageType: "custom", systemPrompt: "x" });
+    assert.equal(await settle(h), undefined, "continuations do not reset the review");
+    await h.hooks.before_agent_start({ messageType: "user", systemPrompt: "x" });
+    for (let i = 0; i < 3; i++) await h.hooks.tool_execution_end({ toolName: "read" });
+    h.answer({ content: [{ type: "text", text: "VERDICT: COMPLETE" }], stopReason: "stop" });
+    assert.equal(await settle(h), undefined);
+    assert.match(h.notices.at(-1)!, /complete/);
+    await h.hooks.before_agent_start({ messageType: "user", systemPrompt: "x" });
+    for (let i = 0; i < 3; i++) await h.hooks.tool_execution_end({ toolName: "read" });
+    assert.equal(await settle(h, { outcome: "error" }), undefined, "failed runs are not reviewed");
+    assert.equal(h.calls.length, 2);
+  } finally { h.cleanup(); }
+});
+
+test("auto consult after consecutive failures appends advice to the failing result", async () => {
+  const h = harness("test/strong");
+  try {
+    await h.hooks.session_start({}, h.ctx);
+    await h.command("failures 2");
+    const fail = (text: string) => h.hooks.tool_result({ toolName: "bash", isError: true, content: [{ type: "text", text }] }, h.ctx);
+    assert.equal(await fail("err 1"), undefined);
+    await h.hooks.tool_result({ toolName: "bash", isError: false, content: [] }, h.ctx);
+    assert.equal(await fail("err 2"), undefined, "a success resets the streak");
+    const result = await fail("ENOENT: missing file");
+    assert.match(h.calls[0][1].messages[0].content, /last 2 tool calls failed[\s\S]*ENOENT: missing file/);
+    assert.equal(result.content[0].text, "ENOENT: missing file");
+    assert.match(result.content[1].text, /\[Advisor, after 2 consecutive tool failures\]\nCheck the boundary condition\./);
+    assert.equal(await fail("again"), undefined, "the streak restarts after a consultation");
+    await h.command("failures off");
+    await fail("x"); await fail("y"); await fail("z");
+    assert.equal(h.calls.length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("session consultation limit applies to every consultation", async () => {
+  const h = harness("test/strong");
+  try {
+    await h.hooks.session_start({}, h.ctx);
+    await h.command("limit 1");
+    assert.equal((await h.execute()).details.status, "reviewed");
+    const blocked = await h.execute();
+    assert.match(blocked.content[0].text, /consultation limit for this session \(1\) is reached/);
+    assert.equal(h.calls.length, 1);
+    await h.command("status");
+    assert.match(h.notices.at(-1)!, /Session limit: 1\/1/);
+    await h.hooks.session_start({}, h.ctx);
+    assert.equal((await h.execute()).details.status, "reviewed", "a new session has a fresh budget");
+    await h.command("limit nope");
+    assert.match(h.notices.at(-1)!, /Usage/);
   } finally { h.cleanup(); }
 });
