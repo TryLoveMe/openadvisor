@@ -1,7 +1,7 @@
 {
-  "name": "secondlook",
+  "name": "openadvisor",
   "version": "0.2.0",
-  "description": "Get a second look from another model at key decision points — for Pi and DeepSeek Harness (dsh)",
+  "description": "An open advisor for coding agents: a second model reviews key decisions — for Pi and DeepSeek Harness (dsh)",
   "type": "module",
   "license": "MIT",
   "keywords": [

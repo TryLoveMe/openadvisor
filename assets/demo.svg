@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" xml:space="preserve" width="920" height="1010" viewBox="0 0 920 1010" role="img" aria-labelledby="title desc">
-  <title id="title">How secondlook works</title>
+  <title id="title">How openadvisor works</title>
   <desc id="desc">Diagram: deepseek-v4-pro is the main agent and does the work with its tools; claude-opus-5-5 is the advisor on call. It is consulted when the agent calls the advisor tool, automatically after three tool failures in a row, or when you run /advisor ask; advice returns to the agent, which keeps working. When the agent is about to finish, an automatic review returns a verdict and real gaps get one more round.</desc>
   <defs>
     <marker id="arrowO" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#f0883e"/></marker>
@@ -29,7 +29,7 @@
   <text x="460" y="20" text-anchor="middle" class="sm dd">~/app · zsh · 92×58</text>
 
   <!-- header -->
-  <text x="460" y="62" text-anchor="middle" class="h b"><tspan class="w">SECONDLOOK</tspan><tspan class="dd">  ·  </tspan><tspan class="o">DEEPSEEK-V4-PRO</tspan><tspan class="w"> BUILDS</tspan><tspan class="dd">  ·  </tspan><tspan class="p">CLAUDE-OPUS-5-5</tspan><tspan class="w"> LOOKS TWICE</tspan></text>
+  <text x="460" y="62" text-anchor="middle" class="h b"><tspan class="w">OPENADVISOR</tspan><tspan class="dd">  ·  </tspan><tspan class="o">DEEPSEEK-V4-PRO</tspan><tspan class="w"> BUILDS</tspan><tspan class="dd">  ·  </tspan><tspan class="p">CLAUDE-OPUS-5-5</tspan><tspan class="w"> LOOKS TWICE</tspan></text>
   <line x1="24" y1="78" x2="896" y2="78" stroke="#3a4252" stroke-width="2"/>
 
   <!-- legend -->

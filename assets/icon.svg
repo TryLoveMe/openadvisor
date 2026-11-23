@@ -1,4 +1,10 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#0d9488"/>
-  <text x="32" y="32" dy="0.35em" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="32" font-weight="600" fill="#ffffff">A</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="openadvisor">
+  <rect x="0.5" y="0.5" width="63" height="63" rx="14" fill="#0b0f17" stroke="#2a3140"/>
+  <!-- the main agent: a terminal prompt -->
+  <path d="M12 12l7 6-7 6" fill="none" stroke="#f0883e" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M23 24h9" stroke="#f0883e" stroke-width="3.4" stroke-linecap="round"/>
+  <!-- the advisor: a second look through the lens -->
+  <circle cx="37" cy="38" r="11" fill="#a78bfa" fill-opacity="0.14" stroke="#b9a3ff" stroke-width="3.6"/>
+  <path d="M45.5 46.5l7 7" stroke="#b9a3ff" stroke-width="4.4" stroke-linecap="round"/>
+  <path d="M32 38.5l3.5 3.5 6-7" fill="none" stroke="#56d364" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

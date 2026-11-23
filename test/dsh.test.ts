@@ -192,7 +192,7 @@ test("built plugin loads under plain Node without TypeScript tooling", () => {
     "const m = await import('./dist/dsh/index.js'); console.log(m.name, typeof m.apply, typeof m.Config['~standard'].validate)"],
   { encoding: "utf8" });
   assert.equal(output.status, 0, output.stderr);
-  assert.equal(output.stdout.trim(), "secondlook function function");
+  assert.equal(output.stdout.trim(), "openadvisor function function");
 });
 
 test("dsh: context argument, /advisor ask, and session limit", async () => {
@@ -220,7 +220,7 @@ test("dsh: auto review steers once per turn and skips small turns and subagents"
     await h.toolResult("bash", false); await h.toolResult("edit", false);
     await h.stopTurn(2);
     assert.equal(h.steered.length, 1);
-    assert.equal(h.steered[0].source.kind, "secondlook");
+    assert.equal(h.steered[0].source.kind, "openadvisor");
     assert.match(h.steered[0].content[0].text, /found gaps[\s\S]*run the tests/);
     await h.toolResult("bash", false); await h.toolResult("bash", false);
     await h.stopTurn(2);

@@ -10,11 +10,11 @@ import {
 } from "../extensions/core.ts";
 import type { Agent, CommandResult, Context, Dispose, LlmService, ToolDefinition, UserMessage } from "./types.ts";
 
-export const name = "secondlook";
+export const name = "openadvisor";
 export const inject = ["tools", "llm", "commands", "systemPrompt"];
 
 /** Message source kind for advisor notes the main model receives. */
-export const SOURCE_KIND = "secondlook";
+export const SOURCE_KIND = "openadvisor";
 
 export interface DshAdvisorConfig extends Partial<Omit<AdvisorConfig, "model">> {
   /** Advisor as provider/model-id. Overrides the saved choice; "off" or null disables. Omit to use the saved choice. */
@@ -41,10 +41,10 @@ function parseDshConfig(value: unknown): DshAdvisorConfig {
 export const Config = {
   "~standard": {
     version: 1 as const,
-    vendor: "secondlook",
+    vendor: "openadvisor",
     validate(value: unknown) {
       try { return { value: parseDshConfig(value) }; }
-      catch (error) { return { issues: [{ message: `secondlook: ${(error as Error).message}` }] }; }
+      catch (error) { return { issues: [{ message: `openadvisor: ${(error as Error).message}` }] }; }
     },
   },
 };
@@ -107,7 +107,7 @@ export function apply(ctx: Context, config: DshAdvisorConfig = {}) {
   let saved: AdvisorConfig = { model: null };
   let configError: string | undefined;
   try { saved = readConfig(configPath); }
-  catch (error) { configError = (error as Error).message; console.warn(`[secondlook] ${configError}`); }
+  catch (error) { configError = (error as Error).message; console.warn(`[openadvisor] ${configError}`); }
 
   let selected: string | null = configModel !== undefined ? configModel : saved.model;
   let tuning: Partial<AdvisorConfig> = { ...saved, ...configTuning };
@@ -233,7 +233,7 @@ export function apply(ctx: Context, config: DshAdvisorConfig = {}) {
   let order = 2850;
   try { order = ctx.systemPrompt.getSectionOrder("TOOL_SUBAGENT") + 50; } catch { /* keep the fallback position */ }
   ctx.systemPrompt.section({
-    name: "secondlook:guidance",
+    name: "openadvisor:guidance",
     order,
     interpolate: false,
     replacement: "",
@@ -351,7 +351,7 @@ export function apply(ctx: Context, config: DshAdvisorConfig = {}) {
   }
 
   ctx.commands.register({
-    definitionId: "secondlook/advisor",
+    definitionId: "openadvisor/advisor",
     name: "advisor",
     description: "Choose an advisor, ask it a question, or configure automatic reviews",
     input: { hint: "provider/model-id | list | ask <question> | review on|off | failures <n>|off | off | status" },
@@ -359,5 +359,5 @@ export function apply(ctx: Context, config: DshAdvisorConfig = {}) {
   });
 
   syncTool();
-  ctx.effect(() => () => { consultant.cancelAll(); }, "secondlook in-flight consultations");
+  ctx.effect(() => () => { consultant.cancelAll(); }, "openadvisor in-flight consultations");
 }

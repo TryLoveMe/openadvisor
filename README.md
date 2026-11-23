@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="assets/icon.svg" width="80" height="80" alt="secondlook">
+<img src="assets/icon.svg" width="80" height="80" alt="openadvisor">
 
-# secondlook
+# openadvisor
 
 **让另一个模型再看一眼——给你的编码 Agent 配一位顾问，关键时刻先听听第二意见。**
 
@@ -20,7 +20,7 @@
 ---
 
 <p align="center">
-  <img src="assets/demo.svg" width="860" alt="secondlook 工作方式示意图：主模型干活，顾问随时待命；连续失败、主模型主动提问、你用 /advisor ask 提问三种方式咨询；结束前自动审查，发现缺口就再做一轮">
+  <img src="assets/demo.svg" width="860" alt="openadvisor 工作方式示意图：主模型干活，顾问随时待命；连续失败、主模型主动提问、你用 /advisor ask 提问三种方式咨询；结束前自动审查，发现缺口就再做一轮">
   <br>
   <sub>工作方式示意图（非真实截图）</sub>
 </p>
@@ -81,9 +81,9 @@ pi install .
 需要 dsh 0.2.x、Node.js 24.22.3+ 和 pnpm
 
 ```bash
-git clone https://github.com/TryLoveMe/secondlook.git
-cd secondlook && npm install   # 生成 dist/
-dsh plugin --profile web add ./secondlook
+git clone https://github.com/TryLoveMe/openadvisor.git
+cd openadvisor && npm install   # 生成 dist/
+dsh plugin --profile web add ./openadvisor
 dsh web
 ```
 
@@ -184,8 +184,8 @@ pi --advisor off
 在 profile 的 `cordis.patch.yml` 中加入：
 
 ```yaml
-- id: secondlook
-  name: secondlook/dsh
+- id: openadvisor
+  name: openadvisor/dsh
   config:
     model: deepseek-official/<model-id>   # off 表示关闭；省略则使用保存的选择
     maxTokens: 4096

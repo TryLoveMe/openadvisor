@@ -1,9 +1,9 @@
 # DeepSeek Harness layer: mounts the advisor plugin.
-# Override this row (id: secondlook) in a profile's cordis.patch.yml to set config, e.g.:
+# Override this row (id: openadvisor) in a profile's cordis.patch.yml to set config, e.g.:
 #   config:
 #     model: deepseek/deepseek-reasoner
 #     maxTokens: 4096
 #     timeoutMs: 120000
 - insert:
-    - id: secondlook
-      name: secondlook/dsh
+    - id: openadvisor
+      name: openadvisor/dsh

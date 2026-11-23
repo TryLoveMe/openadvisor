@@ -10,7 +10,7 @@ import { matchModels, readConfig, resolveModel, saveConfig, saveModel, serialize
 const model = { provider: "test", id: "strong", maxTokens: 8192, reasoning: true };
 
 function harness(flag?: string) {
-  const directory = mkdtempSync(join(tmpdir(), "secondlook-test-"));
+  const directory = mkdtempSync(join(tmpdir(), "openadvisor-test-"));
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = directory;
   const hooks: Record<string, Function> = {};
