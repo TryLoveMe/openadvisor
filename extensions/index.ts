@@ -1,15 +1,24 @@
 import { join } from "node:path";
 import { buildSessionContext, getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { ADVISOR_GUIDANCE, ADVISOR_SYSTEM, modelKey, readConfig, resolveModel, saveConfig, serializeTranscript } from "./core.ts";
+import {
+  ADVISOR_GUIDANCE, ADVISOR_SYSTEM, QUESTION_DESCRIPTION, TOOL_DESCRIPTION, UsageTally,
+  consultationPrompt, formatDuration, interpretAdvice, matchModels, modelKey, readConfig, resolveModel, saveModel,
+  serializeTranscript, settingsOf, unavailable, type AdvisorSettings,
+} from "./core.ts";
+
+type Registry = ExtensionContext["modelRegistry"];
 
 export default function advisorExtension(pi: ExtensionAPI) {
   const configPath = join(getAgentDir(), "advisor.json");
   let selected: string | null = null;
+  let settings: AdvisorSettings = settingsOf({});
   let configError: string | undefined;
   let busy = false;
   let generation = 0;
   let activeController: AbortController | undefined;
+  let registry: Registry | undefined;
+  const tally = new UsageTally();
 
   function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info") {
     if (ctx.hasUI) ctx.ui.notify(message, level);
@@ -27,30 +36,52 @@ export default function advisorExtension(pi: ExtensionAPI) {
     pi.setActiveTools(active);
   }
 
+  function cancelInFlight() {
+    generation++;
+    activeController?.abort();
+  }
+
+  function describe(): string {
+    const lines = [`Advisor: ${selected ?? "off"}`];
+    if (selected) lines.push(`Limits: ${settings.maxTokens} output tokens, ${formatDuration(settings.timeoutMs)}, reasoning ${settings.reasoning}`);
+    lines.push(tally.describe());
+    if (configError) lines.push(configError);
+    return lines.join("\n");
+  }
+
   pi.registerFlag("advisor", {
     type: "string",
     description: "Advisor provider/model-id (or off), for this process only",
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    generation++;
-    activeController?.abort();
+    cancelInFlight();
+    registry = ctx.modelRegistry;
+    tally.reset();
     try {
-      selected = readConfig(configPath).model;
+      const config = readConfig(configPath);
+      selected = config.model;
+      settings = settingsOf(config);
       configError = undefined;
     } catch (error) {
       selected = null;
+      settings = settingsOf({});
       configError = (error as Error).message;
       notify(ctx, configError, "warning");
     }
     const flag = pi.getFlag("advisor");
-    if (typeof flag === "string") selected = flag === "off" ? null : flag;
+    if (typeof flag === "string" && flag.trim()) selected = flag.trim() === "off" ? null : flag.trim();
+    if (selected) {
+      // Normalize bare IDs and catch typos at startup instead of at the first consultation.
+      try { selected = modelKey(resolveModel(selected, ctx.modelRegistry.getAll())); }
+      catch (error) { notify(ctx, `${(error as Error).message} Consultations will fail until it is fixed.`, "warning"); }
+    }
     syncTool();
     status(ctx);
     if (selected) notify(ctx, `Advisor enabled: ${selected}. Consultations use additional tokens and share the conversation with that provider.`, "info");
   });
 
-  pi.on("session_shutdown", async () => { activeController?.abort(); });
+  pi.on("session_shutdown", async () => { cancelInFlight(); });
 
   pi.on("before_agent_start", async (event) => {
     if (selected) return { systemPrompt: `${event.systemPrompt}\n\n${ADVISOR_GUIDANCE}` };
@@ -58,10 +89,16 @@ export default function advisorExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("advisor", {
     description: "Choose an advisor model, show status, or turn off (/advisor off)",
+    getArgumentCompletions: (prefix) => {
+      const keys = ["off", "status", ...(registry?.getAvailable().map(modelKey).sort() ?? [])];
+      const items = matchModels(prefix, keys).map((value) => ({ value, label: value }));
+      return items.length ? items : null;
+    },
     handler: async (args, ctx) => {
+      registry = ctx.modelRegistry;
       let spec = args.trim();
       if (spec === "status" || (!spec && !ctx.hasUI)) {
-        status(ctx, `Advisor: ${selected ?? "off"}${configError ? `\n${configError}` : ""}`);
+        status(ctx, describe());
         return;
       }
       if (!spec) {
@@ -72,11 +109,11 @@ export default function advisorExtension(pi: ExtensionAPI) {
       }
       try {
         const next = spec === "off" ? null : modelKey(resolveModel(spec, ctx.modelRegistry.getAll()));
-        await saveConfig(configPath, { model: next });
+        const saved = await saveModel(configPath, next);
         selected = next;
+        settings = settingsOf(saved);
         configError = undefined;
-        generation++;
-        activeController?.abort();
+        cancelInFlight();
         syncTool();
         status(ctx, next ? `Advisor set to ${next}. Consultations share the current conversation and use additional tokens.` : "Advisor off");
       } catch (error) {
@@ -88,13 +125,14 @@ export default function advisorExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "advisor",
     label: "Advisor",
-    description: "Consult a second model for advice on an important decision, recurring error, or completion review. The current conversation is attached automatically. The advisor cannot run tools or change files. Continue the task after evaluating its advice.",
+    description: TOOL_DESCRIPTION,
     promptSnippet: "Ask a second model for guidance at key decision points",
     defaultActive: false,
     executionMode: "sequential",
-    parameters: Type.Object({ question: Type.String({ minLength: 1, description: "A focused question, with the decision or uncertainty to review" }) }),
+    parameters: Type.Object({ question: Type.String({ minLength: 1, description: QUESTION_DESCRIPTION }) }),
     async execute(_id, { question }, signal, onUpdate, ctx) {
       const modelSpec = selected;
+      const limits = settings;
       const requestGeneration = generation;
       const result = (state: string, text: string, extra = {}) => ({
         content: [{ type: "text" as const, text }],
@@ -105,7 +143,7 @@ export default function advisorExtension(pi: ExtensionAPI) {
       busy = true;
       const controller = new AbortController();
       activeController = controller;
-      const signals = [controller.signal, AbortSignal.timeout(120_000)];
+      const signals = [controller.signal, AbortSignal.timeout(limits.timeoutMs)];
       if (signal) signals.push(signal);
       const combined = AbortSignal.any(signals);
       try {
@@ -114,25 +152,33 @@ export default function advisorExtension(pi: ExtensionAPI) {
         ctx.ui.setStatus("advisor", `Advising: ${modelKey(model)}`);
         onUpdate?.(result("advising", `Advising · ${modelKey(model)}`));
         const messages = buildSessionContext(ctx.sessionManager.getBranch()).messages;
+        const reasoning = model.reasoning && limits.reasoning !== "off" ? limits.reasoning as "high" : undefined;
         const response = await ctx.modelRegistry.streamSimple(model, {
           systemPrompt: ADVISOR_SYSTEM,
-          messages: [{ role: "user", content: `Main agent system prompt (reference only):\n${ctx.getSystemPrompt()}\n\nCurrent conversation (quoted JSON):\n${serializeTranscript(messages)}\n\nConsultation question:\n${question}`, timestamp: Date.now() }],
-        }, { signal: combined, maxTokens: Math.min(4096, model.maxTokens), reasoning: "high" }).result();
+          messages: [{
+            role: "user",
+            content: consultationPrompt({ systemPrompt: ctx.getSystemPrompt(), transcript: serializeTranscript(messages), question }),
+            timestamp: Date.now(),
+          }],
+        }, { signal: combined, maxTokens: Math.min(limits.maxTokens, model.maxTokens), reasoning }).result();
         if (combined.aborted || generation !== requestGeneration) throw new Error("Consultation cancelled or advisor configuration changed");
         if (response.stopReason === "error" || response.stopReason === "aborted") {
           throw new Error(response.errorMessage || response.stopReason);
         }
-        const text = response.content.filter((block) => block.type === "text").map((block) => block.text).join("\n").trim();
-        if (!text) return result("declined", "Advisor declined: no readable guidance returned.", { usage: response.usage });
-        const state = text.startsWith("DECLINED:") ? "declined" : "reviewed";
-        const warning = response.stopReason === "length" ? "\n\n[Advisor output reached its token limit; guidance may be incomplete.]" : "";
-        return result(state, `${state === "reviewed" ? "Reviewed" : "Declined"} · ${modelKey(model)}\n\n${text}${warning}`, { usage: response.usage });
+        const usage = response.usage;
+        tally.add({ input: usage?.input, output: usage?.output, cost: usage?.cost?.total });
+        const text = response.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+        const advice = interpretAdvice(modelKey(model), text, response.stopReason === "length");
+        return result(advice.status, advice.text, { usage });
       } catch (error) {
-        const message = combined.aborted ? "Consultation cancelled or timed out" : (error as Error).message;
-        return result("unavailable", `Advisor unavailable: ${message}. Continue using your own evidence; do not assume a review occurred.`);
+        const timedOut = !controller.signal.aborted && !signal?.aborted && combined.aborted;
+        const reason = timedOut ? `timed out after ${formatDuration(limits.timeoutMs)}`
+          : combined.aborted ? "consultation cancelled" : (error as Error).message;
+        const advice = unavailable(reason);
+        return result(advice.status, advice.text);
       } finally {
         busy = false;
-        activeController = undefined;
+        if (activeController === controller) activeController = undefined;
         status(ctx);
       }
     },

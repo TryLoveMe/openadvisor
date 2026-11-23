@@ -1,32 +1,56 @@
 {
   "name": "pi-advisor",
   "version": "0.1.0",
-  "description": "A second model for advice at key decision points in Pi",
+  "description": "A second model for advice at key decision points in Pi and DeepSeek Harness (dsh)",
   "type": "module",
   "license": "MIT",
   "keywords": [
     "pi-package",
     "pi-extension",
+    "dsh-plugin",
     "advisor"
   ],
   "files": [
     "extensions",
+    "dsh/*.ts",
+    "dsh/cordis.patch.yml",
+    "dist",
     "README.md",
     "LICENSE",
     "assets"
   ],
+  "exports": {
+    "./dsh": "./dist/dsh/index.js",
+    "./extensions/*": "./extensions/*",
+    "./package.json": "./package.json"
+  },
   "pi": {
     "extensions": [
       "./extensions/index.ts"
     ]
   },
+  "dsh": {
+    "bundle": {
+      "patch": "./dsh/cordis.patch.yml"
+    }
+  },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
     "check": "tsc --noEmit",
-    "test": "tsx --test test/*.test.ts"
+    "test": "npm run build && tsx --test test/*.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.6.0",
@@ -36,6 +60,7 @@
     "typescript": "^5.9.0"
   },
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0 <0.3.0"
   }
 }

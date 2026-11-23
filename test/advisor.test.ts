@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import extension from "../extensions/index.ts";
-import { readConfig, resolveModel, saveConfig, serializeTranscript } from "../extensions/core.ts";
+import { matchModels, readConfig, resolveModel, saveConfig, saveModel, serializeTranscript } from "../extensions/core.ts";
 
-const model = { provider: "test", id: "strong", maxTokens: 8192 };
+const model = { provider: "test", id: "strong", maxTokens: 8192, reasoning: true };
 
 function harness(flag?: string) {
   const directory = mkdtempSync(join(tmpdir(), "pi-advisor-test-"));
@@ -53,6 +53,7 @@ function harness(flag?: string) {
   return {
     hooks, ctx, notices, calls, get tool() { return tool; }, get active() { return active; },
     command: (args: string) => command.handler(args, ctx),
+    complete: (prefix: string) => command.getArgumentCompletions(prefix),
     execute: (signal?: AbortSignal) => tool.execute("call", { question: "What did I miss?" }, signal, undefined, ctx),
     answer: (value: any) => { answer = value; }, directory,
     cleanup() {
@@ -113,6 +114,7 @@ test("default off; command persists model, enables tool, injects guidance and of
     assert.ok(context.messages[0].content.includes("What did I miss?"));
     assert.equal(context.tools, undefined);
     assert.equal(options.maxTokens, 4096);
+    assert.equal(options.reasoning, "high");
     await h.command("off");
     assert.deepEqual(h.active, ["read", "bash"]);
     assert.equal(await h.hooks.before_agent_start({ systemPrompt: "Original" }), undefined);
@@ -188,4 +190,74 @@ test("Pi CLI loads the extension and reports status without an API request", asy
     assert.match(output.stderr, /Advisor: off/);
     assert.equal(output.stdout, "");
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("config tuning fields are validated and preserved when the model changes", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "advisor-tuning-"));
+  try {
+    const path = join(directory, "advisor.json");
+    writeFileSync(path, JSON.stringify({ model: "a/b", maxTokens: 1000, timeoutMs: 5000, reasoning: "medium", extra: 1 }));
+    assert.deepEqual(readConfig(path), { model: "a/b", maxTokens: 1000, timeoutMs: 5000, reasoning: "medium" });
+    await saveModel(path, null);
+    assert.deepEqual(readConfig(path), { model: null, maxTokens: 1000, timeoutMs: 5000, reasoning: "medium" });
+    writeFileSync(path, '{"model":"a/b","timeoutMs":0}');
+    assert.throws(() => readConfig(path), /timeoutMs/);
+    await saveModel(path, "a/c");
+    assert.deepEqual(readConfig(path), { model: "a/c" });
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("transcript drops per-message bookkeeping but keeps tool arguments and is compact", () => {
+  const serialized = serializeTranscript([{
+    role: "assistant", api: "x", provider: "p", model: "m", usage: { input: 1 }, timestamp: 1,
+    content: [{ type: "toolCall", name: "pick", arguments: { model: "keep-me", provider: "keep-too" } }],
+  }, { role: "toolResult", toolName: "pick", details: { huge: "ui-only" }, content: [{ type: "text", text: "ok" }] }]);
+  const parsed = JSON.parse(serialized);
+  assert.deepEqual(Object.keys(parsed[0]).sort(), ["content", "role"]);
+  assert.deepEqual(parsed[0].content[0].arguments, { model: "keep-me", provider: "keep-too" });
+  assert.equal(parsed[1].details, undefined);
+  assert.ok(!serialized.includes("\n  "));
+  assert.ok(!serialized.includes("\n"));
+});
+
+test("command completions offer subcommands and filter models", async () => {
+  const h = harness();
+  try {
+    await h.hooks.session_start({}, h.ctx);
+    assert.deepEqual((await h.complete("")).map((item: any) => item.value), ["off", "status", "test/strong"]);
+    assert.deepEqual((await h.complete("STR")).map((item: any) => item.value), ["test/strong"]);
+    assert.equal(await h.complete("zzz"), null);
+    assert.deepEqual(matchModels("o", ["b/o", "off"]), ["off", "b/o"]);
+  } finally { h.cleanup(); }
+});
+
+test("saved limits reach the provider; usage is tallied in status; unknown startup model warns", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.directory, "advisor.json"), JSON.stringify({ model: "strong", maxTokens: 100, reasoning: "off" }));
+    await h.hooks.session_start({}, h.ctx);
+    assert.ok(h.active.includes("advisor"));
+    await h.execute();
+    const options = h.calls[0][2];
+    assert.equal(options.maxTokens, 100);
+    assert.equal(options.reasoning, undefined);
+    await h.command("status");
+    assert.match(h.notices.at(-1)!, /Advisor: test\/strong[\s\S]*1 consultation\(s\): 10 input \/ 5 output/);
+  } finally { h.cleanup(); }
+  const typo = harness("missing/model");
+  try {
+    await typo.hooks.session_start({}, typo.ctx);
+    assert.ok(typo.notices.some((notice) => /Unknown advisor model/.test(notice)));
+  } finally { typo.cleanup(); }
+});
+
+test("timeouts are reported as such", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.directory, "advisor.json"), JSON.stringify({ model: "test/strong", timeoutMs: 20 }));
+    await h.hooks.session_start({}, h.ctx);
+    h.answer((_model: unknown, _context: unknown, options: any) => new Promise((_, reject) =>
+      options.signal.addEventListener("abort", () => reject(new Error("aborted")))));
+    assert.match((await h.execute()).content[0].text, /timed out after 20ms/);
+  } finally { h.cleanup(); }
 });

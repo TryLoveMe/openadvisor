@@ -1,0 +1,9 @@
+# DeepSeek Harness layer: mounts the advisor plugin.
+# Override this row (id: pi-advisor) in a profile's cordis.patch.yml to set config, e.g.:
+#   config:
+#     model: deepseek/deepseek-reasoner
+#     maxTokens: 4096
+#     timeoutMs: 120000
+- insert:
+    - id: pi-advisor
+      name: pi-advisor/dsh
