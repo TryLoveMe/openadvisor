@@ -71,7 +71,7 @@ pi install .
 需要 dsh 0.2.x、Node.js 24.22.3+ 和 pnpm
 
 ```bash
-git clone <本仓库> pi-advisor
+git clone https://github.com/TryLoveMe/pi-advisor.git
 cd pi-advisor && npm install   # 生成 dist/
 dsh plugin --profile web add ./pi-advisor
 dsh web
